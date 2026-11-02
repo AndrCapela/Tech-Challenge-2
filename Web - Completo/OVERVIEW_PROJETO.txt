@@ -1,0 +1,314 @@
+================================================================================
+VISÃO GERAL E DOCUMENTAÇÃO TÉCNICA DO PROJETO (ETAPAS 1, 2 E 3)
+Tech Challenge — Fase 2 | Projeto 2: Otimização de Rotas Hospitalares (VRP)
+================================================================================
+
+1. OBJETIVO E FUNCIONAMENTO GERAL DO SISTEMA
+--------------------------------------------------------------------------------
+O sistema resolve o problema do "Caixeiro Viajante Médico" ampliado para Múltiplos
+Veículos (VRP — Vehicle Routing Problem) para um hospital universitário.
+
+Em vez de apenas encontrar o caminho mais curto entre pontos (como no TSP clássico),
+o sistema distribui medicamentos e insumos partindo de um Hospital Universitário
+Central (Centro de Distribuição / Depósito #0) para diversas unidades de saúde
+(UTIs, Pronto-Socorros, UPAs, UBS) e pacientes domiciliares (Home Care), respeitando
+restrições reais de logística hospitalar:
+
+1) Múltiplos Veículos Heterogêneos:
+   A frota possui N veículos configuráveis, onde CADA veículo possui sua própria
+   capacidade máxima de carga (em kg) e sua própria autonomia máxima de distância
+   (em pixels/km).
+
+2) Prioridades Médicas de Entrega:
+   - Nível 3 — Crítico (UTI / Emergência): Hemoderivados, kits de intubação,
+     quimioterápicos, cilindros de O2. Devem ser entregues nas primeiras paradas.
+   - Nível 2 — Urgente (Refrigerados / UPA): Insulina refrigerada, antibióticos
+     pediátricos, anticoagulantes.
+   - Nível 1 — Regular (Insumos Básicos): Soro fisiológico, luvas, gazes, vacinas
+     de rotina, fraldas hospitalares.
+
+3) Retorno Obrigatório ao Depósito:
+   Todo veículo parte do Hospital Central (#0), atende sua sequência de unidades
+   e retorna ao Hospital Central (#0).
+
+
+2. ORGANIZAÇÃO DAS PASTAS E ARQUITETURA DO CÓDIGO
+--------------------------------------------------------------------------------
+O projeto em `Fase 2\7 - Tech Challenge` está separado em duas pastas:
+
+- `Local - Simples/`:
+  Contém a versão inicial Desktop em Pygame (`tsp.py`, `genetic_algorithm.py`,
+  `draw_functions.py`, `benchmark_att48.py`).
+
+- `Web - Completo/`:
+  Contém a aplicação Web interativa completa das Etapas 1, 2, 3 e 4 + Conteinerização:
+  * `web_app.py`: Servidor Web (Flask) com Streaming em tempo real (SSE) e rotas
+    para geração (`/api/solution/generate-json`) e download (`/api/solution/download-json`)
+    do arquivo JSON da solução.
+  * `templates/index.html`: Interface Web Interativa (Canvas 2D com setas direcionais,
+    Gráfico de Convergência, Tabela de Pontos, Controles de Penalidade e Botões JSON).
+  * `vrp_core.py`: NÚCLEO VRP COMPARTILHADO que centraliza a estrutura `DeliveryPoint`,
+    os cenários hospitalares, a divisão de rotas por veículo (`split_route_into_vehicles`)
+    e o cálculo da Função Fitness e Penalidades (`evaluate_solution_details`). É consumido
+    igualmente por todos os 5 algoritmos.
+  * `route_optimizer_dispatcher.py`: Orquestrador Principal que recebe os parâmetros
+    (incluindo os pesos de penalidade) e invoca o algoritmo escolhido.
+  * `genetic_algorithm.py`: Contém exclusivamente os operadores evolucionários do
+    Algoritmo Genético (GA).
+  * `algo_ant_colony.py`: Ant Colony Optimization (Colônia de Formigas - ACO).
+  * `algo_simulated_annealing.py`: Simulated Annealing (Têmpera Simulada + 2-opt).
+  * `algo_nearest_neighbor.py`: Nearest Neighbor (Vizinho Mais Próximo Multi-Start + 2-opt).
+  * `algo_convex_hull.py`: Convex Hull (Envoltória Convexa + Inserção).
+  * `llm_driver_assistant.py`: Etapa 4 - Copiloto do Motorista integrado ao Google Gemini
+    com carregamento automático de variáveis via `.env`.
+  * `melhor_rota_hospitalar.json`: Arquivo JSON gerado quando o usuário clica em
+    "Gerar JSON da Solução" na interface Web (pronto para uso pela LLM na Etapa 4).
+  * `test_vrp_system.py`: Suíte de Testes Automatizados (unittest) de ponta a ponta.
+  * `requirements.txt`: Dependências Python (Flask, Gunicorn, Google-GenAI, Dotenv, etc.).
+  * `Dockerfile`: Receita de conteinerização Docker com Python 3.11-slim e Gunicorn.
+  * `docker-compose.yml`: Orquestrador Docker com mapeamento 127.0.0.1:5000, .env e restart automático.
+  * `.dockerignore`: Exclusão de caches e ambientes virtuais da imagem Docker.
+  * `.env.example`: Modelo versionado para configuração da chave GEMINI_API_KEY.
+  * `.env`: Arquivo local com a chave secreta da API (ignorado pelo Git).
+  * `OVERVIEW_PROJETO.md`: Documentação técnica completa em formato Markdown.
+  * `OVERVIEW_PROJETO.txt`: Documentação técnica completa em formato Texto Puro.
+
+
+3. COMO UMA ROTA É DIVIDIDA ENTRE OS VEÍCULOS E AVALIADA (`vrp_core.py`)
+--------------------------------------------------------------------------------
+Toda a regra de negócio hospitalar está centralizada em duas funções dentro de
+`vrp_core.py` (usadas por todos os 5 algoritmos):
+
+3.1. Decodificação de Rota para Múltiplos Veículos (`split_route_into_vehicles`)
+- Qualquer algoritmo trabalha com uma sequência permutada de entregas.
+- O Veículo 1 sai do Hospital Central (#0) e começa a acumular entregas:
+  Antes de visitar o próximo ponto, o sistema verifica:
+  1. Teste de Capacidade: `carga_atual + peso_do_ponto > capacidade_maxima_deste_veiculo`?
+  2. Teste de Autonomia: `distancia_atual + trecho_ate_ponto + retorno_ao_hospital > autonomia_maxima_deste_veiculo`?
+- Se qualquer um dos dois limites for ultrapassado E houver um próximo veículo
+  disponível na frota, o veículo atual retorna ao Hospital Central e o próximo
+  veículo assume a partir dali com seus próprios limites individuais.
+- Se todos os veículos da frota já tiverem sido usados, o último veículo leva os
+  pontos restantes, gerando excesso de carga/autonomia que será penalizado no Fitness.
+
+3.2. Cálculo da Função Fitness e Penalidades Configuráveis na Web (`evaluate_solution_details`)
+O problema é de MINIMIZAÇÃO: quanto MENOR o valor do Fitness, MELHOR é a solução.
+
+Fórmula do Fitness Total:
+  Fitness = Distância Total + Penalidade de Prioridade + Penalidade de Capacidade + Penalidade de Autonomia
+
+Os 3 pesos de penalidade podem ser alterados diretamente na seção "3. Penalidades da
+Função Fitness" na barra lateral da interface Web:
+
+1) Distância Total (`total_distance`):
+   Soma das distâncias euclidianas percorridas por todos os veículos.
+
+2) Penalidade de Prioridade (`priority_penalty`) — Campo Web: "Peso Prioridade Médica" (Padrão: 0.35):
+   Mede o quão tarde uma entrega Crítica (nível 3) ou Urgente (nível 2) foi atendida:
+   - Se Crítica (priority == 3):
+     Penalidade += (distancia_acumulada * 1.2 + (ordem_parada - 1) * 45.0) * priority_penalty_weight
+   - Se Urgente (priority == 2):
+     Penalidade += (distancia_acumulada * 0.4 + (ordem_parada - 1) * 15.0) * priority_penalty_weight
+   - Se Regular (priority == 1):
+     Não gera penalidade de atraso.
+
+3) Penalidade por Excesso de Carga (`capacity_penalty`) — Campo Web: "Multa Excesso Carga (por kg)" (Padrão: 40.0):
+   Penalidade de Capacidade = quilos_excedentes * capacity_penalty_weight
+
+4) Penalidade por Excesso de Autonomia (`autonomy_penalty`) — Campo Web: "Multa Excesso Autonomia (por px)" (Padrão: 15.0):
+   Penalidade de Autonomia = pixels_excedentes * autonomy_penalty_weight
+
+
+4. COMO FUNCIONA CADA UM DOS 5 ALGORITMOS IMPLEMENTADOS
+--------------------------------------------------------------------------------
+4.1. Algoritmo Genético (`genetic_algorithm.py`)
+- População Inicial (Híbrida ou Aleatória), Elitismo dos 2 melhores indivíduos,
+  Seleção por Torneio/Roleta, Cruzamento Order Crossover (OX) e Mutação Híbrida
+  (Inversão 2-opt + Swap + Avanço de Prioridade Crítica).
+
+4.2. Ant Colony Optimization — Colônia de Formigas (`algo_ant_colony.py`)
+- Formigas constroem rotas guiadas pela matriz de feromônio (tau) e pela visibilidade
+  heurística ponderada pela prioridade médica (eta), com evaporação e reforço a cada geração.
+
+4.3. Simulated Annealing — Têmpera Simulada (`algo_simulated_annealing.py`)
+- Explora soluções vizinhas (2-opt e Swap) aceitando movimentos de melhoria ou
+  movimentos probabilísticos de Boltzmann `exp(-delta / T)` conforme a temperatura
+  resfria a cada geração (`T = alpha * T`).
+
+4.4. Nearest Neighbor — Vizinho Mais Próximo Multi-Start + 2-opt (`algo_nearest_neighbor.py`)
+- Escolhe a entrega viável mais próxima ponderada pela urgência médica e evolui ao
+  longo das gerações via Multi-Start (GRASP) combinado com refinamento 2-opt.
+
+4.5. Convex Hull — Envoltória Convexa + Inserção (`algo_convex_hull.py`)
+- Constrói o polígono convexo externo (Monotone Chain) e evolui a ordem de inserção
+  mais barata (Cheapest Insertion) dos pontos internos e busca local por gerações.
+
+
+5. RESUMO DE TODOS OS CONTROLES E EXPORTAÇÃO JSON NA WEB (`http://localhost:5000`)
+--------------------------------------------------------------------------------
+- Seção 1 (Cenário e Coordenadas): Escolhe cenário padrão ou aleatório, edita ou
+  adiciona pontos manualmente (ou clicando direto no mapa de simulação).
+- Seção 2 (Frota de Veículos): Altera a quantidade de veículos (1 a 8) e define a
+  Carga Máxima (kg) e Autonomia (px) individualmente para cada veículo.
+- Seção 3 (Penalidades da Função Fitness): Altera em tempo real o Peso de Prioridade
+  Médica (padrão 0.35), Multa por Excesso de Carga (padrão 40/kg) e Multa por
+  Excesso de Autonomia (padrão 15/px).
+- Seção 4 (Algoritmo / Heurística): Seleciona entre os 5 algoritmos e ajusta seus
+  hiperparâmetros específicos (gerações, população, mutação, formigas, temperatura, etc.).
+- Seção 5 (Execução e Exportação):
+  * "▶ Executar Otimização": Inicia a evolução em tempo real.
+  * "📄 Gerar JSON da Solução": Salva a solução atual em `melhor_rota_hospitalar.json`
+    contendo métricas, pesos de penalidade e rotas detalhadas por veículo.
+  * "⬇️ Baixar JSON da Solução": Habilitado após gerar o JSON, permite ao usuário
+    baixar o arquivo `melhor_rota_hospitalar.json` diretamente pelo navegador.
+  * Ícones "?" de Ajuda Rápida: Tooltips informativos em cada parâmetro com explicações concisas.
+  * Card de Penalidades com Popover (Hover): O card exibe a "Penalidade Total" (soma
+    das 3 penalidades) e, ao passar o mouse, exibe um card flutuante com a decomposição
+    detalhada de cada uma (Prioridade Médica, Excesso de Carga e Excesso de Autonomia).
+  * Gráfico de Convergência com Eixo X Graduado: Exibe números de passo/geração dinâmicos
+    (ex: 0, 40, 80, 120, 160) com linhas de grade sincronizadas com a meta do algoritmo.
+
+
+6. DIAGRAMA DE ARQUITETURA DA SOLUÇÃO COMPLETA
+--------------------------------------------------------------------------------
+  [Navegador Web: templates/index.html]
+     │  (Canvas 2D c/ Setas, Gráfico de Convergência, Tabelas e Chat Gemini)
+     ▼
+  [Servidor Flask: web_app.py]
+     ├──► GET /api/optimize/stream ──► [route_optimizer_dispatcher.py]
+     │                                      ├──► genetic_algorithm.py (GA)
+     │                                      ├──► algo_ant_colony.py (ACO)
+     │                                      ├──► algo_simulated_annealing.py (SA)
+     │                                      ├──► algo_nearest_neighbor.py (NN)
+     │                                      └──► algo_convex_hull.py (CH)
+     │                                               │
+     │                                               ▼
+     │                                     [vrp_core.py (Núcleo VRP)]
+     │                                     (Divisão de Frota + Fitness/Penalidades)
+     │
+     ├──► POST /api/solution/generate-json ──► [melhor_rota_hospitalar.json]
+     └──► POST /api/llm/chat ──────────────► [llm_driver_assistant.py]
+                                                     │
+                                                     ▼
+                                       [Google Gemini Interactions API]
+
+
+7. COMPARATIVO DE DESEMPENHO ENTRE AS 5 ABORDAGENS DE ROTEAMENTO
+--------------------------------------------------------------------------------
+Avaliação no cenário hospitalar padrão (1 Depósito + 14 entregas, 215 kg totais,
+3 veículos com capacidade de 85 kg e autonomia de 950 px):
+
+- Algoritmo Genético (GA): Fitness médio ~1.960 a 2.040 | Excelente exploração
+  global e priorização de entregas Críticas (UTI) nas primeiras paradas.
+- Ant Colony Optimization (ACO): Fitness médio ~1.980 a 2.080 | Aprende boas
+  conexões guiado por feromônio e visibilidade ponderada pela urgência médica.
+- Simulated Annealing (SA): Fitness médio ~1.990 a 2.110 | Muito rápido por passo,
+  escapando de ótimos locais no início da curva de temperatura.
+- Nearest Neighbor + 2-opt (NN): Fitness médio ~1.970 a 2.060 | Encontra uma rota
+  viável forte já na 1ª geração e descruza arestas via busca local 2-opt.
+- Convex Hull + Inserção (CH): Fitness médio ~2.010 a 2.130 | Parte do polígono
+  convexo externo gerando sub-rotas geometricamente limpas.
+
+
+8. ETAPA 4: INTEGRAÇÃO COM GOOGLE GEMINI (`llm_driver_assistant.py`)
+--------------------------------------------------------------------------------
+O módulo `llm_driver_assistant.py` conecta o sistema ao Google Gemini usando o SDK
+oficial `google-genai` (`client.interactions.create` com `gemini-3-flash-preview`):
+
+- Base de Conhecimento (`melhor_rota_hospitalar.json`):
+  Injeta o JSON completo da rota otimizada no `system_instruction`.
+- Instruções para Motoristas, Relatórios Diários/Semanais e Sugestões de Melhoria:
+  Além de responder sobre o próximo destino, pesos e cuidados médicos (UTI/refrigerados),
+  possui botões dedicados para gerar Relatórios Diários/Semanais de Eficiência da
+  Frota e Sugestões de Melhoria no Processo Logístico.
+- Memória Multi-Turno (`previous_interaction_id`):
+  Permite que o motorista converse continuamente mantendo o histórico da conversa.
+
+8.1. INTERFACE RESPONSIVA E NAVEGAÇÃO MOBILE EM ABAS (ERGONOMIA PARA O MOTORISTA)
+--------------------------------------------------------------------------------
+Para permitir que os motoristas utilizem o sistema diretamente em smartphones e tablets
+embarcados nos veículos, a interface web foi refatorada com navegação responsiva em abas:
+1) Abas Mobile (Telas <= 960px): Config, Mapa & Métricas, Rotas e Copiloto Gemini;
+2) Proteção contra Toques no Canvas: Alternador para evitar criação acidental de pontos ao rolar a tela com o dedo;
+3) Detalhamento de Penalidades por Toque: Acesso ao discriminativo de atraso e capacidade em telas de toque;
+4) Preservação Total do Modo Desktop: Em telas amplas (> 960px), a visualização completa e simultânea em duas colunas é mantida.
+
+
+9. TESTES AUTOMATIZADOS (`test_vrp_system.py`)
+--------------------------------------------------------------------------------
+O arquivo `test_vrp_system.py` valida automaticamente:
+1) A criação do cenário hospitalar e divisão de rotas entre múltiplos veículos;
+2) O cálculo das penalidades de prioridade, capacidade e autonomia em `vrp_core.py`;
+3) A execução e convergência dos 5 algoritmos no `route_optimizer_dispatcher.py`;
+4) Os endpoints Flask (`web_app.py`), exportação JSON e geração de prompt da LLM;
+5) A responsividade mobile do template web (`test_mobile_ui_template_and_responsiveness`).
+
+Comando para rodar os testes:
+  python -m unittest test_vrp_system.py -v
+
+
+10. CONTEINERIZAÇÃO COM DOCKER E DEPLOY EM PRODUÇÃO NA VPS (HOSTGATOR + CLOUDPANEL + PORTAINER)
+--------------------------------------------------------------------------------
+A aplicação foi estruturada seguindo as melhores práticas da indústria (12-Factor App)
+para deploy profissional em nuvem, garantindo isolamento total, reprodutibilidade
+e alta disponibilidade.
+
+10.1. Conteinerização com Docker (Dockerfile e docker-compose.yml):
+- Imagem Base: `python:3.11-slim` com flags `PYTHONDONTWRITEBYTECODE=1` e `PYTHONUNBUFFERED=1`
+  para evitar arquivos temporários e manter logs transmitidos em tempo real.
+- Servidor WSGI de Produção: A aplicação é executada via Gunicorn
+  (`gunicorn --workers 2 --bind 0.0.0.0:5000 --timeout 120 web_app:app`), oferecendo suporte
+  a concorrência e conexões persistentes para o streaming SSE.
+- Healthcheck Nativo: Monitoramento de integridade via módulo `urllib.request` do Python padrão
+  (`http://localhost:5000/`), sem necessidade de instalar pacotes extras na imagem.
+- Isolamento de Rede Local: O container expõe a porta `127.0.0.1:5000:5000`, garantindo que
+  conexões externas só entrem pelo Nginx com SSL/HTTPS.
+- Persistência de Dados: O arquivo estruturado `melhor_rota_hospitalar.json` é mapeado via
+  volume, garantindo que as soluções geradas persistam mesmo após reinicializações.
+- Reinicialização Automática (`restart: unless-stopped`): Integrada com o daemon do Docker
+  habilitado no systemd da VPS (`systemctl is-enabled docker -> enabled`). Se o servidor
+  reiniciar por manutenção ou o processo falhar, o container retorna ao ar em menos de 2s.
+
+10.2. Arquitetura de Hospedagem em Produção na VPS:
+A hospedagem foi implementada em uma VPS Linux (HostGator) combinando o painel de
+controle CloudPanel com o Docker:
+
+  [ Usuário na Internet ]
+           │ (HTTPS / Porta 443 com Certificado SSL Let's Encrypt)
+           ▼
+  [ Nginx (CloudPanel) ] ── (Host: app.143.95.175.167.nip.io)
+           │ (Proxy Reverso / HTTP Local)
+           ▼
+  [ Container Docker: vrp_hospital_web (Porta 127.0.0.1:5000) ]
+           │
+           ├── Gunicorn (2 Workers)
+           ├── Flask (web_app.py)
+           └── Google Gemini API (Chave injetada via .env)
+
+- Resolução de Domínio sem Custos Adicionais (`nip.io`): Utilização do serviço wildcard DNS
+  `nip.io`, permitindo acessar o sistema em `app.143.95.175.167.nip.io` com suporte nativo
+  à emissão e renovação automática de certificados SSL gratuitos da Let's Encrypt.
+- Segurança de Acesso SSH: Acesso administrativo à VPS configurado em porta de alta segurança
+  (`22022`) com suporte a autenticação por par de chaves criptográficas `Ed25519`.
+- Segurança de Variáveis de Ambiente: Chaves de API e segredos mantidos estritamente em
+  arquivo `.env` protegido na VPS e ignorados no repositório Git via `.gitignore`.
+
+10.3. Sincronização Otimizada com Git Sparse-Checkout:
+Para evitar o download desnecessário de todas as aulas e fases anteriores do curso na VPS,
+o repositório na nuvem foi configurado com Git Sparse-Checkout:
+  git clone --filter=blob:none --no-checkout https://github.com/AndrCapela/FIAP---IA-para-devs.git /home/app-hospital
+  cd /home/app-hospital
+  git sparse-checkout set "Fase 2/7 - Tech Challenge/Web - Completo"
+  git checkout main
+
+10.4. Gerenciamento e Observabilidade com Portainer CE:
+Para facilitar o monitoramento operacional da aplicação, foi implantado o Portainer
+Community Edition (CE) conteinerizado na mesma VPS:
+- Acesso Seguro: `https://portainer.143.95.175.167.nip.io` com SSL dedicado via CloudPanel.
+- Autenticação Segura: Ativação com `setup_token` gerado nos logs do servidor.
+- Recursos em Produção:
+  1) Dashboard Visual de Recursos: Acompanhamento contínuo do consumo de CPU e RAM da VPS.
+  2) Live Logs: Inspeção em tempo real das chamadas à IA do Gemini e requisições SSE dos algoritmos.
+  3) Gestão de Ciclo de Vida: Ações de Restart, Stop e Deploy de containers com 1 clique.
+
+
